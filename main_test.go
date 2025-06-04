@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"reflect" // Added for DeepEqual
 
 	queryv1alpha1 "buf.build/gen/go/parca-dev/parca/protocolbuffers/go/parca/query/v1alpha1"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -155,7 +156,8 @@ func TestParcaQueryHandler(t *testing.T) {
 						TotalValue:        10,
 						Samples: []*JSONStacksSample{
 							{
-								Value: 10,
+								Value:  10,
+								Labels: map[string][]string{"job": {"parca-load"}, "instance": {"localhost:7171"}},
 								Stack: []*JSONStacksFrame{
 									{FunctionName: "main.main", FileName: "main.go", LineNumber: 42, BinaryName: "parca-load"},
 									{FunctionName: "runtime.main", FileName: "proc.go", LineNumber: 250},
@@ -177,8 +179,19 @@ func TestParcaQueryHandler(t *testing.T) {
 						respReport.ReportType, respReport.Unit, respReport.TotalValue)
 				}
 				if len(respReport.Samples) != 1 || respReport.Samples[0].Value != 10 {
-					t.Error("Unexpected JSONStacksReport sample data")
+					t.Errorf("Unexpected JSONStacksReport sample data: expected 1 sample with value 10, got %d samples", len(respReport.Samples))
+					if len(respReport.Samples) > 0 {
+						t.Logf("Sample 0 value: %d", respReport.Samples[0].Value)
+					}
+					return // Avoid panic on nil Samples[0]
 				}
+
+				expectedLabels := map[string][]string{"job": {"parca-load"}, "instance": {"localhost:7171"}}
+				if !reflect.DeepEqual(respReport.Samples[0].Labels, expectedLabels) {
+					t.Errorf("Unexpected JSONStacksReport sample labels: got %+v, want %+v",
+						respReport.Samples[0].Labels, expectedLabels)
+				}
+
 				if len(respReport.Samples[0].Stack) != 2 || respReport.Samples[0].Stack[0].FunctionName != "main.main" {
 					t.Error("Unexpected JSONStacksReport stack data")
 				}

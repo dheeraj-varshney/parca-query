@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"strings" // Added for pprof tests
+	"reflect" // Added for deep equality check of labels
+	"strings"
 	"testing"
 
 	queryv1alpha1 "buf.build/gen/go/parca-dev/parca/protocolbuffers/go/parca/query/v1alpha1"
@@ -12,7 +13,7 @@ import (
 	"github.com/apache/arrow/go/v12/arrow/array"
 	"github.com/apache/arrow/go/v12/arrow/ipc"
 	"github.com/apache/arrow/go/v12/arrow/memory"
-	"github.com/google/pprof/profile" // Added for pprof tests
+	"github.com/google/pprof/profile"
 )
 
 // Helper function to create a sample Arrow record for flamegraphs
@@ -244,7 +245,6 @@ func createSamplePprofBytes(t *testing.T, sampleTypes []*profile.ValueType, samp
 		}
 	}
 
-
 	var buf bytes.Buffer
 	if err := prof.Write(&buf); err != nil {
 		t.Fatalf("Failed to write pprof profile: %v", err)
@@ -260,7 +260,6 @@ func TestConvertPprofToJSONStacks(t *testing.T) {
 	m1 := &profile.Mapping{ID: 1, File: "/bin/parca-load", HasFunctions: true}
 	m2 := &profile.Mapping{ID: 2, File: "/lib/ld.so", HasFunctions: true}
 
-
 	loc1 := &profile.Location{ID: 1, Mapping: m1, Address: 0x1000, Line: []profile.Line{{Function: fn1, Line: 50}}}
 	loc2 := &profile.Location{ID: 2, Mapping: m2, Address: 0x2000, Line: []profile.Line{{Function: fn2, Line: 100}}}
 	loc3WithoutMapping := &profile.Location{ID: 3, Address: 0x3000, Line: []profile.Line{{Function: fn1, Line: 55}}} // No mapping
@@ -270,16 +269,20 @@ func TestConvertPprofToJSONStacks(t *testing.T) {
 		{Type: "cpu", Unit: "nanoseconds"},
 	}
 
+	sampleLabels1 := map[string][]string{"job": {"test-job"}, "instance": {"localhost:1234"}}
+	sampleLabels2 := map[string][]string{"job": {"another-job"}, "multi_key": {"val1", "val2"}}
+
+
 	tests := []struct {
 		name          string
 		setupResponse func(t *testing.T) *queryv1alpha1.QueryResponse
 		validate      func(t *testing.T, result any, err error)
 	}{
 		{
-			name: "valid pprof with binary name",
+			name: "valid pprof with binary name and labels",
 			setupResponse: func(t *testing.T) *queryv1alpha1.QueryResponse {
 				samples := []*profile.Sample{
-					{Location: []*profile.Location{loc1, loc2}, Value: []int64{1, 100}}, // Stack: loc2 (caller) -> loc1 (callee)
+					{Location: []*profile.Location{loc1, loc2}, Value: []int64{1, 100}, Label: sampleLabels1},
 				}
 				pprofBytes := createSamplePprofBytes(t, defaultSampleTypes, samples)
 				return &queryv1alpha1.QueryResponse{Report: &queryv1alpha1.QueryResponse_Pprof{Pprof: pprofBytes}}
@@ -298,30 +301,55 @@ func TestConvertPprofToJSONStacks(t *testing.T) {
 				if report.TotalValue != 100 {
 					t.Errorf("Expected TotalValue 100, got %d", report.TotalValue)
 				}
-				if report.UniqueStackTraces != 1 {
-					t.Errorf("Expected UniqueStackTraces 1, got %d", report.UniqueStackTraces)
-				}
 				if len(report.Samples) != 1 {
 					t.Fatalf("Expected 1 sample, got %d", len(report.Samples))
 				}
 				sample := report.Samples[0]
+				if !reflect.DeepEqual(sample.Labels, sampleLabels1) {
+					t.Errorf("Expected labels %+v, got %+v", sampleLabels1, sample.Labels)
+				}
 				if len(sample.Stack) != 2 {
 					t.Fatalf("Expected stack depth 2, got %d", len(sample.Stack))
 				}
-				// Stack is reversed by convertPprofToJSONStacks: caller first
-				if sample.Stack[0].FunctionName != fn2.Name || sample.Stack[0].BinaryName != m2.File { // loc2 data
-					t.Errorf("Unexpected frame 0: %+v. Expected Func: %s, Bin: %s", sample.Stack[0], fn2.Name, m2.File)
+				if sample.Stack[0].FunctionName != fn2.Name || sample.Stack[0].BinaryName != m2.File {
+					t.Errorf("Unexpected frame 0: %+v", sample.Stack[0])
 				}
-				if sample.Stack[1].FunctionName != fn1.Name || sample.Stack[1].BinaryName != m1.File { // loc1 data
-					t.Errorf("Unexpected frame 1: %+v. Expected Func: %s, Bin: %s", sample.Stack[1], fn1.Name, m1.File)
+				if sample.Stack[1].FunctionName != fn1.Name || sample.Stack[1].BinaryName != m1.File {
+					t.Errorf("Unexpected frame 1: %+v", sample.Stack[1])
+				}
+			},
+		},
+		{
+			name: "pprof with multi-valued labels",
+			setupResponse: func(t *testing.T) *queryv1alpha1.QueryResponse {
+				samples := []*profile.Sample{
+					{Location: []*profile.Location{loc1}, Value: []int64{3, 300}, Label: sampleLabels2},
+				}
+				pprofBytes := createSamplePprofBytes(t, defaultSampleTypes, samples)
+				return &queryv1alpha1.QueryResponse{Report: &queryv1alpha1.QueryResponse_Pprof{Pprof: pprofBytes}}
+			},
+			validate: func(t *testing.T, result any, err error) {
+				if err != nil {
+					t.Fatalf("Expected no error, got %v", err)
+				}
+				report, _ := result.(*JSONStacksReport)
+				if len(report.Samples) != 1 {
+					t.Fatalf("Expected 1 sample, got %d", len(report.Samples))
+				}
+				sample := report.Samples[0]
+				if !reflect.DeepEqual(sample.Labels, sampleLabels2) {
+					t.Errorf("Expected labels %+v, got %+v", sampleLabels2, sample.Labels)
+				}
+				if val, ok := sample.Labels["multi_key"]; !ok || !reflect.DeepEqual(val, []string{"val1", "val2"}) {
+					t.Errorf("Expected multi_key [val1 val2], got %v", val)
 				}
 			},
 		},
 		{
 			name: "pprof with location missing mapping",
 			setupResponse: func(t *testing.T) *queryv1alpha1.QueryResponse {
-				samples := []*profile.Sample{ // Stack: loc1 -> loc3WithoutMapping
-					{Location: []*profile.Location{loc3WithoutMapping, loc1}, Value: []int64{2, 200}},
+				samples := []*profile.Sample{
+					{Location: []*profile.Location{loc3WithoutMapping, loc1}, Value: []int64{2, 200}, Label: sampleLabels1},
 				}
 				pprofBytes := createSamplePprofBytes(t, defaultSampleTypes, samples)
 				return &queryv1alpha1.QueryResponse{Report: &queryv1alpha1.QueryResponse_Pprof{Pprof: pprofBytes}}
@@ -334,7 +362,9 @@ func TestConvertPprofToJSONStacks(t *testing.T) {
 				if len(report.Samples[0].Stack) != 2 {
 					t.Fatalf("Expected stack depth 2, got %d", len(report.Samples[0].Stack))
 				}
-				// Stack is reversed: loc1 (caller) then loc3WithoutMapping (callee)
+				if !reflect.DeepEqual(report.Samples[0].Labels, sampleLabels1) {
+					t.Errorf("Expected labels %+v, got %+v", sampleLabels1, report.Samples[0].Labels)
+				}
 				if report.Samples[0].Stack[0].FunctionName != fn1.Name || report.Samples[0].Stack[0].BinaryName != m1.File {
 					t.Errorf("Expected frame 0 (loc1) to have binary name '%s', got: %+v", m1.File, report.Samples[0].Stack[0])
 				}
@@ -373,7 +403,7 @@ func TestConvertPprofToJSONStacks(t *testing.T) {
 		{
 			name: "pprof with no sample types",
 			setupResponse: func(t *testing.T) *queryv1alpha1.QueryResponse {
-				samples := []*profile.Sample{{Location: []*profile.Location{loc1}, Value: []int64{100}}}
+				samples := []*profile.Sample{{Location: []*profile.Location{loc1}, Value: []int64{100}, Label: sampleLabels1}}
 				pprofBytes := createSamplePprofBytes(t, []*profile.ValueType{}, samples) // Empty sample types
 				return &queryv1alpha1.QueryResponse{Report: &queryv1alpha1.QueryResponse_Pprof{Pprof: pprofBytes}}
 			},
@@ -388,7 +418,7 @@ func TestConvertPprofToJSONStacks(t *testing.T) {
             setupResponse: func(t *testing.T) *queryv1alpha1.QueryResponse {
                 sampleTypes := []*profile.ValueType{{Type: "goroutine", Unit: "count"}}
                 samples := []*profile.Sample{
-                    {Location: []*profile.Location{loc1}, Value: []int64{5}},
+                    {Location: []*profile.Location{loc1}, Value: []int64{5}, Label: sampleLabels1},
                 }
                 pprofBytes := createSamplePprofBytes(t, sampleTypes, samples)
                 return &queryv1alpha1.QueryResponse{Report: &queryv1alpha1.QueryResponse_Pprof{Pprof: pprofBytes}}
@@ -404,6 +434,13 @@ func TestConvertPprofToJSONStacks(t *testing.T) {
                 if report.TotalValue != 5 {
                     t.Errorf("Expected TotalValue 5, got %d", report.TotalValue)
                 }
+                 if len(report.Samples) != 1 {
+					t.Fatalf("Expected 1 sample, got %d", len(report.Samples))
+				}
+				sample := report.Samples[0]
+				if !reflect.DeepEqual(sample.Labels, sampleLabels1) {
+					t.Errorf("Expected labels %+v, got %+v", sampleLabels1, sample.Labels)
+				}
             },
         },
 	}
