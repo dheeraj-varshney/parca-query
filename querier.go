@@ -139,10 +139,11 @@ func NewQuerier(reg *prometheus.Registry, client queryv1alpha1connect.QueryServi
 }
 
 // QueryParca fetches data from Parca based on the provided query parameters.
-// It can return either a *queryv1alpha1.QueryResponse or a custom JSON structure (for json_flamegraph).
+// It can return either a *queryv1alpha1.QueryResponse or a custom JSON structure (for json_flamegraph or json_stacks).
 func (q *Querier) QueryParca(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (any, error) {
 	var actualReportTypeForParca queryv1alpha1.QueryRequest_ReportType
 	isJSONFlamegraph := false
+	isJSONStacks := false
 
 	switch reportTypeStr {
 	case "pprof":
@@ -154,6 +155,9 @@ func (q *Querier) QueryParca(ctx context.Context, queryStr string, start time.Ti
 	case "json_flamegraph":
 		actualReportTypeForParca = queryv1alpha1.QueryRequest_REPORT_TYPE_FLAMEGRAPH_ARROW
 		isJSONFlamegraph = true
+	case "json_stacks":
+		actualReportTypeForParca = queryv1alpha1.QueryRequest_REPORT_TYPE_PPROF
+		isJSONStacks = true
 	default:
 		if reportTypeStr == "" {
 			return nil, errors.New("reportType parameter is missing")
@@ -185,10 +189,118 @@ func (q *Querier) QueryParca(ctx context.Context, queryStr string, start time.Ti
 	if isJSONFlamegraph {
 		// Convert the FLAMEGRAPH_ARROW response to our custom JSON format.
 		return convertFlamegraphArrowToJSON(resp.Msg)
+	} else if isJSONStacks {
+		// Convert the PPROF response to our custom JSON stacks format.
+		return convertPprofToJSONStacks(resp.Msg)
 	}
 
 	return resp.Msg, nil
 }
+
+// convertPprofToJSONStacks is a placeholder for converting Parca's
+// PPROF response to a custom JSON stacks structure.
+func convertPprofToJSONStacks(resp *queryv1alpha1.QueryResponse) (any, error) {
+	if resp == nil || len(resp.GetPprof()) == 0 {
+		return nil, errors.New("malformed or empty pprof response")
+	}
+
+	pprofBytes := resp.GetPprof()
+	reader := bytes.NewReader(pprofBytes)
+
+	parsedProfile, err := profile.ParseData(reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse pprof data: %w", err)
+	}
+
+	if len(parsedProfile.SampleType) == 0 {
+		return nil, errors.New("pprof profile has no sample types defined")
+	}
+	if len(parsedProfile.Sample) == 0 {
+		// Not necessarily an error, could be an empty profile. Return empty report.
+		return &JSONStacksReport{
+			ReportType: "json_stacks",
+			Unit:       parsedProfile.SampleType[len(parsedProfile.SampleType)-1].Type, // Use last sample type as unit
+			Samples:    []*JSONStacksSample{},
+		}, nil
+	}
+
+	// Determine the unit and the index for the value we care about.
+	// Typically, the last SampleType and corresponding value are the primary ones.
+	valueTypeIndex := len(parsedProfile.SampleType) - 1
+	unit := parsedProfile.SampleType[valueTypeIndex].Type
+
+	report := &JSONStacksReport{
+		ReportType: "json_stacks",
+		Unit:       unit,
+		Samples:    make([]*JSONStacksSample, 0, len(parsedProfile.Sample)),
+	}
+
+	for _, sample := range parsedProfile.Sample {
+		if len(sample.Value) <= valueTypeIndex {
+			// This sample doesn't have the expected value type, skip or error?
+			// For now, log and skip.
+			log.Printf("Warning: pprof sample does not have enough values for selected sample type. Sample: %+v, Expected index: %d", sample, valueTypeIndex)
+			continue
+		}
+
+		jsonSample := &JSONStacksSample{
+			Value: sample.Value[valueTypeIndex],
+			Stack: make([]*JSONStacksFrame, 0, len(sample.Location)),
+		}
+		report.TotalValue += jsonSample.Value
+
+		// Pprof locations are from callee to caller. We want to reverse it for typical stack display (caller to callee).
+		for i := len(sample.Location) - 1; i >= 0; i-- {
+			loc := sample.Location[i]
+			// A location can have multiple lines (e.g., for inlined functions).
+			// We iterate through all lines, but often only the first one is most relevant for simple stacks.
+			for _, line := range loc.Line {
+				if line.Function == nil { // Should not happen in valid pprof
+					continue
+				}
+				jsonFrame := &JSONStacksFrame{
+					FunctionName: line.Function.Name,
+					FileName:     line.Function.Filename,
+					LineNumber:   line.Line,
+				}
+				// Add BinaryName from Mapping
+				if loc.Mapping != nil && loc.Mapping.File != "" {
+					jsonFrame.BinaryName = loc.Mapping.File
+				}
+				jsonSample.Stack = append(jsonSample.Stack, jsonFrame)
+			}
+		}
+		report.Samples = append(report.Samples, jsonSample)
+	}
+
+	report.UniqueStackTraces = len(report.Samples) // In pprof, each Sample is typically a unique stack trace.
+	return report, nil
+}
+
+
+// JSONStacksFrame defines the structure for a single frame in a stack trace.
+type JSONStacksFrame struct {
+	FunctionName string `json:"function_name"`
+	FileName     string `json:"file_name"`
+	LineNumber   int64  `json:"line_number"`
+	BinaryName   string `json:"binary_name,omitempty"`
+}
+
+// JSONStacksSample defines a single sample with its value and stack trace.
+type JSONStacksSample struct {
+	Value int64             `json:"value"`
+	Stack []*JSONStacksFrame `json:"stack"`
+}
+
+// JSONStacksReport defines the overall structure for the JSON stacks report.
+type JSONStacksReport struct {
+	ReportType        string              `json:"report_type"`
+	Unit              string              `json:"unit"`
+	UniqueStackTraces int                 `json:"unique_stack_traces"`
+	TotalValue        int64               `json:"total_value"`
+	Samples           []*JSONStacksSample `json:"samples"`
+}
+
 
 // FlamegraphNode defines the structure for a node in the JSON flamegraph.
 type FlamegraphNode struct {

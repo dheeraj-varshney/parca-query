@@ -236,6 +236,19 @@ func (h *apiHandler) parcaQueryHandler(w http.ResponseWriter, r *http.Request) {
 		} else {
 			log.Printf("Successfully served Parca query (json_flamegraph): %s, range: %s - %s", query, startStr, endStr)
 		}
+	} else if reportType == "json_stacks" {
+		jsonStacksReport, ok := parcaResponse.(*JSONStacksReport)
+		if !ok || jsonStacksReport == nil {
+			log.Printf("Error: QueryParca returned unexpected type for json_stacks or nil report. Type: %T", parcaResponse)
+			writeJSONError(w, "Internal error processing pprof data", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK) // Set OK status for successful response
+		if err := json.NewEncoder(w).Encode(jsonStacksReport); err != nil {
+			log.Printf("Error marshalling JSONStacksReport response: %v", err)
+		} else {
+			log.Printf("Successfully served Parca query (json_stacks): %s, range: %s - %s", query, startStr, endStr)
+		}
 	} else {
 		// Standard protobuf message response
 		actualProtoResponse, ok := parcaResponse.(*queryv1alpha1.QueryResponse)

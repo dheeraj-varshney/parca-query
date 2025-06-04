@@ -137,6 +137,78 @@ func TestParcaQueryHandler(t *testing.T) {
 			expectedStatusCode: http.StatusInternalServerError,
 			expectedErrorMsg:   "Internal error processing flamegraph data",
 		},
+		// Test cases for json_stacks
+		{
+			name: "success json_stacks",
+			queryParams: map[string]string{
+				"query":      `{__name__="process_cpu"}`,
+				"start":      validStartTimeStr,
+				"end":        validEndTimeStr,
+				"reportType": "json_stacks",
+			},
+			mockSetup: func(mq *mockParcaQuerier) {
+				mq.QueryParcaFunc = func(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (any, error) {
+					sampleReport := &JSONStacksReport{
+						ReportType:        "json_stacks",
+						Unit:              "samples",
+						UniqueStackTraces: 1,
+						TotalValue:        10,
+						Samples: []*JSONStacksSample{
+							{
+								Value: 10,
+								Stack: []*JSONStacksFrame{
+									{FunctionName: "main.main", FileName: "main.go", LineNumber: 42, BinaryName: "parca-load"},
+									{FunctionName: "runtime.main", FileName: "proc.go", LineNumber: 250},
+								},
+							},
+						},
+					}
+					return sampleReport, nil
+				}
+			},
+			expectedStatusCode: http.StatusOK,
+			checkBody: func(t *testing.T, body []byte, expectedStatusCode int) {
+				var respReport JSONStacksReport
+				if err := json.Unmarshal(body, &respReport); err != nil {
+					t.Fatalf("Failed to unmarshal JSONStacksReport response body: %v. Body: %s", err, string(body))
+				}
+				if respReport.ReportType != "json_stacks" || respReport.Unit != "samples" || respReport.TotalValue != 10 {
+					t.Errorf("Unexpected JSONStacksReport metadata: got type '%s', unit '%s', total %d",
+						respReport.ReportType, respReport.Unit, respReport.TotalValue)
+				}
+				if len(respReport.Samples) != 1 || respReport.Samples[0].Value != 10 {
+					t.Error("Unexpected JSONStacksReport sample data")
+				}
+				if len(respReport.Samples[0].Stack) != 2 || respReport.Samples[0].Stack[0].FunctionName != "main.main" {
+					t.Error("Unexpected JSONStacksReport stack data")
+				}
+				if respReport.Samples[0].Stack[0].BinaryName != "parca-load" {
+					t.Errorf("Expected BinaryName 'parca-load', got '%s'", respReport.Samples[0].Stack[0].BinaryName)
+				}
+			},
+		},
+		{
+			name: "json_stacks - QueryParca returns conversion error",
+			queryParams: map[string]string{"query": "test", "start": validStartTimeStr, "end": validEndTimeStr, "reportType": "json_stacks"},
+			mockSetup: func(mq *mockParcaQuerier) {
+				mq.QueryParcaFunc = func(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (any, error) {
+					return nil, errors.New("mock pprof conversion error")
+				}
+			},
+			expectedStatusCode: http.StatusInternalServerError,
+			expectedErrorMsg:   "mock pprof conversion error",
+		},
+		{
+			name: "json_stacks - QueryParca returns wrong type (handler type assertion error)",
+			queryParams: map[string]string{"query": "test", "start": validStartTimeStr, "end": validEndTimeStr, "reportType": "json_stacks"},
+			mockSetup: func(mq *mockParcaQuerier) {
+				mq.QueryParcaFunc = func(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (any, error) {
+					return &queryv1alpha1.QueryResponse{}, nil // Returning incorrect type for json_stacks
+				}
+			},
+			expectedStatusCode: http.StatusInternalServerError,
+			expectedErrorMsg:   "Internal error processing pprof data",
+		},
 		{
 			name:               "missing query parameter",
 			queryParams:        map[string]string{"start": validStartTimeStr, "end": validEndTimeStr, "reportType": "pprof"},
