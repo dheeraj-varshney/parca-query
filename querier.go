@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"github.com/apache/arrow/go/v12/arrow/array"
+	"github.com/apache/arrow/go/v12/arrow/ipc"
+	"github.com/google/pprof/profile"
 	"log"
 	"math/rand"
 	"sort"
@@ -207,7 +211,7 @@ func convertPprofToJSONStacks(resp *queryv1alpha1.QueryResponse) (any, error) {
 	pprofBytes := resp.GetPprof()
 	reader := bytes.NewReader(pprofBytes)
 
-	parsedProfile, err := profile.ParseData(reader)
+	parsedProfile, err := profile.Parse(reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse pprof data: %w", err)
 	}
@@ -278,7 +282,6 @@ func convertPprofToJSONStacks(resp *queryv1alpha1.QueryResponse) (any, error) {
 	return report, nil
 }
 
-
 // JSONStacksFrame defines the structure for a single frame in a stack trace.
 type JSONStacksFrame struct {
 	FunctionName string `json:"function_name"`
@@ -302,7 +305,6 @@ type JSONStacksReport struct {
 	TotalValue        int64               `json:"total_value"`
 	Samples           []*JSONStacksSample `json:"samples"`
 }
-
 
 // FlamegraphNode defines the structure for a node in the JSON flamegraph.
 type FlamegraphNode struct {
@@ -368,10 +370,10 @@ func convertFlamegraphArrowToJSON(resp *queryv1alpha1.QueryResponse) (any, error
 
 	// Function details (might be nested or prefixed, e.g., "function.name")
 	// Assuming flat column names for now based on common Parca usage.
-	idxFunctionName := getColumnIndex("function_name")         // string
+	idxFunctionName := getColumnIndex("function_name")              // string
 	idxFunctionSystemName := getColumnIndex("function_system_name") // string
-	idxFunctionFilename := getColumnIndex("function_filename")     // string
-	idxFunctionStartLine := getColumnIndex("function_start_line") // int64 or int32
+	idxFunctionFilename := getColumnIndex("function_filename")      // string
+	idxFunctionStartLine := getColumnIndex("function_start_line")   // int64 or int32
 
 	// Validate required columns are present
 	if idxLocationID == -1 || idxParentID == -1 || idxValue == -1 || idxFunctionName == -1 {
@@ -383,20 +385,21 @@ func convertFlamegraphArrowToJSON(resp *queryv1alpha1.QueryResponse) (any, error
 
 	// First pass: Create all nodes
 	for i := 0; i < int(record.NumRows()); i++ {
-		locationID := record.Column(idxLocationID).(array.Uint64Array).Value(i)
+		locationID := record.Column(idxLocationID).(*array.Uint64).Value(i)
 
 		nodeValue := uint64(0)
 		switch arr := record.Column(idxValue).(type) {
 		case *array.Int64:
 			val := arr.Value(i)
-			if val < 0 { val = 0 } // Value should be non-negative
+			if val < 0 {
+				val = 0
+			} // Value should be non-negative
 			nodeValue = uint64(val)
 		case *array.Uint64:
 			nodeValue = arr.Value(i)
 		default:
 			return nil, fmt.Errorf("unexpected type for 'value' column: %T", record.Column(idxValue))
 		}
-
 
 		node := &FlamegraphNode{
 			Value:    nodeValue,
@@ -435,8 +438,8 @@ func convertFlamegraphArrowToJSON(resp *queryv1alpha1.QueryResponse) (any, error
 	potentialRoots := 0
 
 	for i := 0; i < int(record.NumRows()); i++ {
-		locationID := record.Column(idxLocationID).(array.Uint64Array).Value(i)
-		parentID := record.Column(idxParentID).(array.Uint64Array).Value(i)
+		locationID := record.Column(idxLocationID).(*array.Uint64).Value(i)
+		parentID := record.Column(idxParentID).(*array.Uint64).Value(i)
 
 		currentNode, ok := nodes[locationID]
 		if !ok {
@@ -451,8 +454,8 @@ func convertFlamegraphArrowToJSON(resp *queryv1alpha1.QueryResponse) (any, error
 			// We assume the node with parentID == 0 (or self-reference if that's the convention) is the true root.
 			// If multiple true roots are found, it's an issue.
 			if actualRoot == nil && parentID == 0 { // Prefer parentID == 0 as root
-			    actualRoot = currentNode
-			    potentialRoots++
+				actualRoot = currentNode
+				potentialRoots++
 			} else if actualRoot == nil && parentID == locationID { // Fallback if no parentID == 0 found yet
 				actualRoot = currentNode
 				potentialRoots++
@@ -466,7 +469,6 @@ func convertFlamegraphArrowToJSON(resp *queryv1alpha1.QueryResponse) (any, error
 			// Add to rootNodes for now, will pick one later or ensure there's only one significant one.
 			rootNodes = append(rootNodes, currentNode)
 
-
 		} else {
 			parentNode, ok := nodes[parentID]
 			if ok {
@@ -475,84 +477,86 @@ func convertFlamegraphArrowToJSON(resp *queryv1alpha1.QueryResponse) (any, error
 				// This might indicate a broken tree or a node whose parent is not in this record (should not happen for flamegraphs)
 				log.Printf("Warning: Parent node with id %d not found for child %d. Attaching to a default root or ignoring.", parentID, locationID)
 				// For now, let's add it as a root if its parent is missing, though this is usually not expected.
-                // Or, create a dummy root if actualRoot is still nil after this loop.
-                rootNodes = append(rootNodes, currentNode)
+				// Or, create a dummy root if actualRoot is still nil after this loop.
+				rootNodes = append(rootNodes, currentNode)
 
 			}
 		}
 	}
 
 	// Determine the final root to return
-    if actualRoot != nil {
-        // Prune rootNodes to only contain the actualRoot if it was identified
-        // This handles cases where other nodes might have also seemed like roots initially
-        finalRoots := []*FlamegraphNode{}
-        for _, r := range rootNodes {
-            isChild := false
-            for _, n := range nodes {
-                for _, child := range n.Children {
-                    if child == r {
-                        isChild = true
-                        break
-                    }
-                }
-                if isChild { break }
-            }
-            if !isChild {
-                finalRoots = append(finalRoots,r)
-            }
-        }
-        if len(finalRoots) == 1 {
-            actualRoot = finalRoots[0]
-        } else if len(finalRoots) > 1 {
-             // If multiple true roots, this is complex. Default to the one with largest value or first one.
-             log.Printf("Warning: Multiple true root nodes identified (%d). Selecting the one with highest value or first.", len(finalRoots))
-             // Simple heuristic: pick the one with the largest value, or the first one.
-             // This part might need more sophisticated handling depending on Parca's exact output for complex cases.
-             if actualRoot == nil && len(finalRoots) > 0 { actualRoot = finalRoots[0] } // Default to first if actualRoot wasn't set
-             for _, r := range finalRoots {
-                 if r.Value > actualRoot.Value {
-                     actualRoot = r
-                 }
-             }
-        } else if len(finalRoots) == 0 && len(nodes) > 0 { // All nodes are part of some tree, but no clear single root.
-            return nil, errors.New("failed to identify a clear root node, but nodes exist")
-        }
-    }
-
+	if actualRoot != nil {
+		// Prune rootNodes to only contain the actualRoot if it was identified
+		// This handles cases where other nodes might have also seemed like roots initially
+		finalRoots := []*FlamegraphNode{}
+		for _, r := range rootNodes {
+			isChild := false
+			for _, n := range nodes {
+				for _, child := range n.Children {
+					if child == r {
+						isChild = true
+						break
+					}
+				}
+				if isChild {
+					break
+				}
+			}
+			if !isChild {
+				finalRoots = append(finalRoots, r)
+			}
+		}
+		if len(finalRoots) == 1 {
+			actualRoot = finalRoots[0]
+		} else if len(finalRoots) > 1 {
+			// If multiple true roots, this is complex. Default to the one with largest value or first one.
+			log.Printf("Warning: Multiple true root nodes identified (%d). Selecting the one with highest value or first.", len(finalRoots))
+			// Simple heuristic: pick the one with the largest value, or the first one.
+			// This part might need more sophisticated handling depending on Parca's exact output for complex cases.
+			if actualRoot == nil && len(finalRoots) > 0 {
+				actualRoot = finalRoots[0]
+			} // Default to first if actualRoot wasn't set
+			for _, r := range finalRoots {
+				if r.Value > actualRoot.Value {
+					actualRoot = r
+				}
+			}
+		} else if len(finalRoots) == 0 && len(nodes) > 0 { // All nodes are part of some tree, but no clear single root.
+			return nil, errors.New("failed to identify a clear root node, but nodes exist")
+		}
+	}
 
 	if actualRoot == nil && len(nodes) > 0 {
-        // If no root was identified by parent_id == 0 or self-reference,
-        // it could be that the root is the node with no parent pointing to it from *other* nodes,
-        // or the dataset is malformed.
-        // A simple fallback: if there's only one node, it's the root.
-        // Or, if there are multiple "rootCandidates" (nodes not parented by others in the list),
-        // we might need a dummy root or error out.
-        if len(rootNodes) == 1 {
-            actualRoot = rootNodes[0]
-        } else if len(rootNodes) > 1 {
-            // This indicates multiple disconnected trees or multiple nodes claiming to be roots.
-            // Create a synthetic root? For now, error or pick one.
-            // Let's pick the one with the highest value, as a heuristic.
-            log.Printf("Multiple root candidates (%d) found. Picking one with max value.", len(rootNodes))
-            for _, rNode := range rootNodes {
-                if actualRoot == nil || rNode.Value > actualRoot.Value {
-                    actualRoot = rNode
-                }
-            }
-             if actualRoot == nil { // If all values were 0 or rootNodes was empty
-                 return nil, errors.New("multiple root candidates, but unable to pick one")
-             }
-        } else {
-		    return nil, errors.New("no root node identified in flamegraph")
-        }
+		// If no root was identified by parent_id == 0 or self-reference,
+		// it could be that the root is the node with no parent pointing to it from *other* nodes,
+		// or the dataset is malformed.
+		// A simple fallback: if there's only one node, it's the root.
+		// Or, if there are multiple "rootCandidates" (nodes not parented by others in the list),
+		// we might need a dummy root or error out.
+		if len(rootNodes) == 1 {
+			actualRoot = rootNodes[0]
+		} else if len(rootNodes) > 1 {
+			// This indicates multiple disconnected trees or multiple nodes claiming to be roots.
+			// Create a synthetic root? For now, error or pick one.
+			// Let's pick the one with the highest value, as a heuristic.
+			log.Printf("Multiple root candidates (%d) found. Picking one with max value.", len(rootNodes))
+			for _, rNode := range rootNodes {
+				if actualRoot == nil || rNode.Value > actualRoot.Value {
+					actualRoot = rNode
+				}
+			}
+			if actualRoot == nil { // If all values were 0 or rootNodes was empty
+				return nil, errors.New("multiple root candidates, but unable to pick one")
+			}
+		} else {
+			return nil, errors.New("no root node identified in flamegraph")
+		}
 	} else if actualRoot == nil && len(nodes) == 0 {
 		return nil, errors.New("no nodes found in flamegraph data")
 	}
 
 	return actualRoot, nil
 }
-
 
 func (q *Querier) Run(ctx context.Context, interval time.Duration) {
 	ctx, cancel := context.WithCancel(ctx)
