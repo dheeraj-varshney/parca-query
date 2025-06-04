@@ -1,19 +1,20 @@
 package main
 
 import (
+	queryv1alpha1 "buf.build/gen/go/parca-dev/parca/protocolbuffers/go/parca/query/v1alpha1"
 	"context"
+	"encoding/json"
 	"flag"
 	"log"
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
-	"encoding/json"
 
 	"buf.build/gen/go/parca-dev/parca/connectrpc/go/parca/query/v1alpha1/queryv1alpha1connect"
-	queryv1alpha1 "buf.build/gen/go/parca-dev/parca/protocolbuffers/go/parca/query/v1alpha1" // Added back as it's used
 	"connectrpc.com/connect"
 	vault "github.com/hashicorp/vault/api"
 	auth "github.com/hashicorp/vault/api/auth/kubernetes"
@@ -34,7 +35,7 @@ func main() {
 	vaultRole := flag.String("vault-role", "parca-load", "The role name of parca-load in Vault")
 	clientTimeout := flag.Duration("client-timeout", 10*time.Second, "Timeout for requests to the Parca instance")
 
-	queryInterval := flag.Duration("query-interval", 5*time.Second, "The time interval between queries to the Parca instance")
+	//queryInterval := flag.Duration("query-interval", 5*time.Second, "The time interval between queries to the Parca instance")
 	queryRangeStr := flag.String("query-range", "15m,12h,168h", "Comma-separated time durations for query")
 
 	flag.Parse()
@@ -122,17 +123,17 @@ func main() {
 			log.Println("HTTP server: stopped")
 		},
 	)
-	gr.Add(
-		func() error {
-			querier.Run(ctx, *queryInterval)
-			return nil
-		},
-		func(error) {
-			log.Println("querier: stopping")
-			querier.Stop()
-			log.Println("querier: stopped")
-		},
-	)
+	//gr.Add(
+	//	func() error {
+	//		querier.Run(ctx, *queryInterval)
+	//		return nil
+	//	},
+	//	func(error) {
+	//		log.Println("querier: stopping")
+	//		querier.Stop()
+	//		log.Println("querier: stopped")
+	//	},
+	//)
 
 	if err := gr.Run(); err != nil {
 		if _, ok := err.(run.SignalError); ok {
@@ -154,7 +155,6 @@ func newHTTPServer(reg *prometheus.Registry, addr string, api *apiHandler) *http
 	handler.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
 	// Register the new Parca query handler
 	handler.HandleFunc("/parcaquery", api.parcaQueryHandler)
-
 
 	server := &http.Server{
 		Addr:    addr,
@@ -185,7 +185,11 @@ func (h *apiHandler) parcaQueryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Parse start time
-	startTime, err := time.Parse(time.RFC3339, startStr)
+	startEpoch, err := strconv.ParseInt(startStr, 10, 64)
+	if err != nil {
+		log.Printf("failed to parse start epoch timestamp: %w", err)
+	}
+	startTime := time.Unix(startEpoch, 0)
 	if err != nil {
 		log.Printf("Error parsing start time '%s': %v", startStr, err)
 		writeJSONError(w, "Invalid start time format. Expected RFC3339.", http.StatusBadRequest)
@@ -193,7 +197,11 @@ func (h *apiHandler) parcaQueryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Parse end time
-	endTime, err := time.Parse(time.RFC3339, endStr)
+	endEpoch, err := strconv.ParseInt(endStr, 10, 64)
+	if err != nil {
+		log.Printf("failed to parse end epoch timestamp: %w", err)
+	}
+	endTime := time.Unix(endEpoch, 0)
 	if err != nil {
 		log.Printf("Error parsing end time '%s': %v", endStr, err)
 		writeJSONError(w, "Invalid end time format. Expected RFC3339.", http.StatusBadRequest)
