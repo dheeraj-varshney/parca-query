@@ -65,7 +65,7 @@ type Querier struct {
 // ParcaQuerier defines the interface for querying Parca.
 // This is implemented by Querier and can be mocked for testing.
 type ParcaQuerier interface {
-	QueryParca(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (*queryv1alpha1.QueryResponse, error)
+	QueryParca(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (any, error)
 }
 
 func NewQuerier(reg *prometheus.Registry, client queryv1alpha1connect.QueryServiceClient, queryTimeRangesConf []time.Duration) *Querier {
@@ -139,16 +139,21 @@ func NewQuerier(reg *prometheus.Registry, client queryv1alpha1connect.QueryServi
 }
 
 // QueryParca fetches data from Parca based on the provided query parameters.
-func (q *Querier) QueryParca(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (*queryv1alpha1.QueryResponse, error) {
-	var reportType queryv1alpha1.QueryRequest_ReportType
+// It can return either a *queryv1alpha1.QueryResponse or a custom JSON structure (for json_flamegraph).
+func (q *Querier) QueryParca(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (any, error) {
+	var actualReportTypeForParca queryv1alpha1.QueryRequest_ReportType
+	isJSONFlamegraph := false
+
 	switch reportTypeStr {
 	case "pprof":
-		reportType = queryv1alpha1.QueryRequest_REPORT_TYPE_PPROF
+		actualReportTypeForParca = queryv1alpha1.QueryRequest_REPORT_TYPE_PPROF
 	case "flamegraph_arrow":
-		reportType = queryv1alpha1.QueryRequest_REPORT_TYPE_FLAMEGRAPH_ARROW
+		actualReportTypeForParca = queryv1alpha1.QueryRequest_REPORT_TYPE_FLAMEGRAPH_ARROW
 	case "table_arrow":
-		reportType = queryv1alpha1.QueryRequest_REPORT_TYPE_TABLE_ARROW
-	// Add other cases as needed based on queryv1alpha1.QueryRequest_ReportType
+		actualReportTypeForParca = queryv1alpha1.QueryRequest_REPORT_TYPE_TABLE_ARROW
+	case "json_flamegraph":
+		actualReportTypeForParca = queryv1alpha1.QueryRequest_REPORT_TYPE_FLAMEGRAPH_ARROW
+		isJSONFlamegraph = true
 	default:
 		if reportTypeStr == "" {
 			return nil, errors.New("reportType parameter is missing")
@@ -165,21 +170,275 @@ func (q *Querier) QueryParca(ctx context.Context, queryStr string, start time.Ti
 				End:   timestamppb.New(end),
 			},
 		},
-		ReportType:        reportType,
+		ReportType:        actualReportTypeForParca,
 		NodeTrimThreshold: &nodeTrimThreshold, // Using the global var from querier.go
 	}
 
 	resp, err := q.client.Query(ctx, connect.NewRequest(queryRequest))
 	if err != nil {
-		// TODO: Consider adding metrics here, similar to queryMerge/querySingle.
-		log.Printf("QueryParca(query=%s, reportType=%s, start=%v, end=%v): failed to make request: %v\n", queryStr, reportTypeStr, start, end, err)
+		log.Printf("QueryParca(query=%s, reportType=%s, start=%v, end=%v): parca client query failed: %v\n", queryStr, reportTypeStr, start, end, err)
 		return nil, fmt.Errorf("parca client query failed: %w", err)
 	}
 
-	// TODO: Consider adding metrics for success here as well.
-	log.Printf("QueryParca(query=%s, reportType=%s, start=%v, end=%v): success\n", queryStr, reportTypeStr, start, end)
+	log.Printf("QueryParca(query=%s, reportType=%s, start=%v, end=%v): parca client query successful\n", queryStr, reportTypeStr, start, end)
+
+	if isJSONFlamegraph {
+		// Convert the FLAMEGRAPH_ARROW response to our custom JSON format.
+		return convertFlamegraphArrowToJSON(resp.Msg)
+	}
+
 	return resp.Msg, nil
 }
+
+// FlamegraphNode defines the structure for a node in the JSON flamegraph.
+type FlamegraphNode struct {
+	Name       string            `json:"name"`
+	SystemName string            `json:"system_name,omitempty"`
+	Filename   string            `json:"filename,omitempty"`
+	StartLine  int32             `json:"start_line,omitempty"`
+	Value      uint64            `json:"value"`
+	Children   []*FlamegraphNode `json:"children"`
+}
+
+// convertFlamegraphArrowToJSON converts Parca's FLAMEGRAPH_ARROW response
+// (an Arrow Record) into a custom JSON tree structure (*FlamegraphNode).
+func convertFlamegraphArrowToJSON(resp *queryv1alpha1.QueryResponse) (any, error) {
+	if resp == nil || resp.GetFlamegraphArrow() == nil || len(resp.GetFlamegraphArrow().GetRecord()) == 0 {
+		return nil, errors.New("malformed or empty flamegraph arrow response")
+	}
+
+	recordBytes := resp.GetFlamegraphArrow().GetRecord()
+	bytesReader := bytes.NewReader(recordBytes)
+
+	// Create an Arrow IPC reader.
+	// Note: Assuming a version of Apache Arrow, e.g., v12.
+	// Actual version might need adjustment based on go.mod or transitive dependencies.
+	ipcReader, err := ipc.NewReader(bytesReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create arrow ipc reader: %w", err)
+	}
+	defer ipcReader.Release()
+
+	if !ipcReader.Next() {
+		if ipcReader.Err() != nil {
+			return nil, fmt.Errorf("ipc reader error on Next(): %w", ipcReader.Err())
+		}
+		return nil, errors.New("no records found in arrow ipc stream")
+	}
+	record := ipcReader.Record()
+	record.Retain() // Retain the record as ipcReader will release it.
+	defer record.Release()
+
+	// Schema and column indices (these are based on common Parca flamegraph schemas)
+	// We need to find these dynamically or assume fixed positions/names if stable.
+	// For robustness, finding by name is better.
+	schema := record.Schema()
+	getColumnIndex := func(name string) int {
+		indices := schema.FieldIndices(name)
+		if len(indices) == 0 {
+			return -1 // Column not found
+		}
+		return indices[0]
+	}
+
+	// Expected column names (adjust if Parca's schema differs)
+	// These are educated guesses based on Parca's typical Arrow structure.
+	// Parca often uses: location_id, parent_id, value, diff, function_name, function_filename, line_start
+	// The 'label' column is often a string representation of the function.
+	// For simplicity, we'll try to use function_name as the primary 'Name'.
+
+	idxLocationID := getColumnIndex("location_id") // uint64
+	idxParentID := getColumnIndex("parent_id")     // uint64 (0 for root's parent)
+	idxValue := getColumnIndex("value")            // int64 or uint64 (cumulative value)
+	// idxDiff := getColumnIndex("diff") // int64 or uint64 (self value, not directly used in this basic node)
+
+	// Function details (might be nested or prefixed, e.g., "function.name")
+	// Assuming flat column names for now based on common Parca usage.
+	idxFunctionName := getColumnIndex("function_name")         // string
+	idxFunctionSystemName := getColumnIndex("function_system_name") // string
+	idxFunctionFilename := getColumnIndex("function_filename")     // string
+	idxFunctionStartLine := getColumnIndex("function_start_line") // int64 or int32
+
+	// Validate required columns are present
+	if idxLocationID == -1 || idxParentID == -1 || idxValue == -1 || idxFunctionName == -1 {
+		return nil, fmt.Errorf("missing essential columns in arrow record (location_id, parent_id, value, function_name). Schema: %s", schema.String())
+	}
+
+	nodes := make(map[uint64]*FlamegraphNode) // Map location_id to FlamegraphNode
+	var rootNodes []*FlamegraphNode           // Could be multiple roots, but typically one for flamegraphs
+
+	// First pass: Create all nodes
+	for i := 0; i < int(record.NumRows()); i++ {
+		locationID := record.Column(idxLocationID).(array.Uint64Array).Value(i)
+
+		nodeValue := uint64(0)
+		switch arr := record.Column(idxValue).(type) {
+		case *array.Int64:
+			val := arr.Value(i)
+			if val < 0 { val = 0 } // Value should be non-negative
+			nodeValue = uint64(val)
+		case *array.Uint64:
+			nodeValue = arr.Value(i)
+		default:
+			return nil, fmt.Errorf("unexpected type for 'value' column: %T", record.Column(idxValue))
+		}
+
+
+		node := &FlamegraphNode{
+			Value:    nodeValue,
+			Children: []*FlamegraphNode{},
+		}
+
+		// Function Name (Primary Name)
+		if idxFunctionName != -1 && !record.Column(idxFunctionName).IsNull(i) {
+			node.Name = record.Column(idxFunctionName).(*array.String).Value(i)
+		} else {
+			node.Name = "[unknown]" // Fallback name
+		}
+
+		if idxFunctionSystemName != -1 && !record.Column(idxFunctionSystemName).IsNull(i) {
+			node.SystemName = record.Column(idxFunctionSystemName).(*array.String).Value(i)
+		}
+		if idxFunctionFilename != -1 && !record.Column(idxFunctionFilename).IsNull(i) {
+			node.Filename = record.Column(idxFunctionFilename).(*array.String).Value(i)
+		}
+		if idxFunctionStartLine != -1 && !record.Column(idxFunctionStartLine).IsNull(i) {
+			// Assuming int64 from Arrow, converting to int32 for struct
+			switch arr := record.Column(idxFunctionStartLine).(type) {
+			case *array.Int32:
+				node.StartLine = arr.Value(i)
+			case *array.Int64:
+				node.StartLine = int32(arr.Value(i))
+			default:
+				// In case of unexpected type, do not set or log warning
+			}
+		}
+		nodes[locationID] = node
+	}
+
+	// Second pass: Link children to parents
+	var actualRoot *FlamegraphNode = nil
+	potentialRoots := 0
+
+	for i := 0; i < int(record.NumRows()); i++ {
+		locationID := record.Column(idxLocationID).(array.Uint64Array).Value(i)
+		parentID := record.Column(idxParentID).(array.Uint64Array).Value(i)
+
+		currentNode, ok := nodes[locationID]
+		if !ok {
+			// Should not happen if first pass was correct
+			return nil, fmt.Errorf("node with location_id %d not found in map", locationID)
+		}
+
+		if parentID == 0 || parentID == locationID { // Common root indicators in Parca
+			// In Parca, the root node often has parent_id == location_id or parent_id == 0.
+			// If there are multiple such nodes, this logic might need refinement,
+			// but typically there's one clear root, or a "fake" root whose value is sum of children.
+			// We assume the node with parentID == 0 (or self-reference if that's the convention) is the true root.
+			// If multiple true roots are found, it's an issue.
+			if actualRoot == nil && parentID == 0 { // Prefer parentID == 0 as root
+			    actualRoot = currentNode
+			    potentialRoots++
+			} else if actualRoot == nil && parentID == locationID { // Fallback if no parentID == 0 found yet
+				actualRoot = currentNode
+				potentialRoots++
+			} else if (parentID == 0 || parentID == locationID) && currentNode != actualRoot {
+				// If we find another root, this is ambiguous.
+				// For now, we'll stick with the first one found.
+				// This could happen if there's a dummy root node and then actual roots.
+				// Parca's flamegraph usually has one dominant root.
+				log.Printf("Warning: Multiple potential root nodes detected (location_id: %d, parent_id: %d). Using first one found.", locationID, parentID)
+			}
+			// Add to rootNodes for now, will pick one later or ensure there's only one significant one.
+			rootNodes = append(rootNodes, currentNode)
+
+
+		} else {
+			parentNode, ok := nodes[parentID]
+			if ok {
+				parentNode.Children = append(parentNode.Children, currentNode)
+			} else {
+				// This might indicate a broken tree or a node whose parent is not in this record (should not happen for flamegraphs)
+				log.Printf("Warning: Parent node with id %d not found for child %d. Attaching to a default root or ignoring.", parentID, locationID)
+				// For now, let's add it as a root if its parent is missing, though this is usually not expected.
+                // Or, create a dummy root if actualRoot is still nil after this loop.
+                rootNodes = append(rootNodes, currentNode)
+
+			}
+		}
+	}
+
+	// Determine the final root to return
+    if actualRoot != nil {
+        // Prune rootNodes to only contain the actualRoot if it was identified
+        // This handles cases where other nodes might have also seemed like roots initially
+        finalRoots := []*FlamegraphNode{}
+        for _, r := range rootNodes {
+            isChild := false
+            for _, n := range nodes {
+                for _, child := range n.Children {
+                    if child == r {
+                        isChild = true
+                        break
+                    }
+                }
+                if isChild { break }
+            }
+            if !isChild {
+                finalRoots = append(finalRoots,r)
+            }
+        }
+        if len(finalRoots) == 1 {
+            actualRoot = finalRoots[0]
+        } else if len(finalRoots) > 1 {
+             // If multiple true roots, this is complex. Default to the one with largest value or first one.
+             log.Printf("Warning: Multiple true root nodes identified (%d). Selecting the one with highest value or first.", len(finalRoots))
+             // Simple heuristic: pick the one with the largest value, or the first one.
+             // This part might need more sophisticated handling depending on Parca's exact output for complex cases.
+             if actualRoot == nil && len(finalRoots) > 0 { actualRoot = finalRoots[0] } // Default to first if actualRoot wasn't set
+             for _, r := range finalRoots {
+                 if r.Value > actualRoot.Value {
+                     actualRoot = r
+                 }
+             }
+        } else if len(finalRoots) == 0 && len(nodes) > 0 { // All nodes are part of some tree, but no clear single root.
+            return nil, errors.New("failed to identify a clear root node, but nodes exist")
+        }
+    }
+
+
+	if actualRoot == nil && len(nodes) > 0 {
+        // If no root was identified by parent_id == 0 or self-reference,
+        // it could be that the root is the node with no parent pointing to it from *other* nodes,
+        // or the dataset is malformed.
+        // A simple fallback: if there's only one node, it's the root.
+        // Or, if there are multiple "rootCandidates" (nodes not parented by others in the list),
+        // we might need a dummy root or error out.
+        if len(rootNodes) == 1 {
+            actualRoot = rootNodes[0]
+        } else if len(rootNodes) > 1 {
+            // This indicates multiple disconnected trees or multiple nodes claiming to be roots.
+            // Create a synthetic root? For now, error or pick one.
+            // Let's pick the one with the highest value, as a heuristic.
+            log.Printf("Multiple root candidates (%d) found. Picking one with max value.", len(rootNodes))
+            for _, rNode := range rootNodes {
+                if actualRoot == nil || rNode.Value > actualRoot.Value {
+                    actualRoot = rNode
+                }
+            }
+             if actualRoot == nil { // If all values were 0 or rootNodes was empty
+                 return nil, errors.New("multiple root candidates, but unable to pick one")
+             }
+        } else {
+		    return nil, errors.New("no root node identified in flamegraph")
+        }
+	} else if actualRoot == nil && len(nodes) == 0 {
+		return nil, errors.New("no nodes found in flamegraph data")
+	}
+
+	return actualRoot, nil
+}
+
 
 func (q *Querier) Run(ctx context.Context, interval time.Duration) {
 	ctx, cancel := context.WithCancel(ctx)

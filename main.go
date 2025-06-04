@@ -144,7 +144,7 @@ func main() {
 
 // apiHandler holds dependencies for HTTP handlers.
 type apiHandler struct {
-	querier *Querier
+	querier ParcaQuerier // Use the interface type
 }
 
 func newHTTPServer(reg *prometheus.Registry, addr string, api *apiHandler) *http.Server {
@@ -219,15 +219,39 @@ func (h *apiHandler) parcaQueryHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Marshal successful response
+	// Handle response based on reportType
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(parcaResponse); err != nil {
-		log.Printf("Error marshalling Parca response: %v", err)
-		// Don't try to write an error response if header already sent, but log it.
-		// Client will likely experience a truncated response.
+
+	if reportType == "json_flamegraph" {
+		flamegraphNode, ok := parcaResponse.(*FlamegraphNode)
+		if !ok || flamegraphNode == nil {
+			log.Printf("Error: QueryParca returned unexpected type for json_flamegraph or nil node. Type: %T", parcaResponse)
+			writeJSONError(w, "Internal error processing flamegraph data", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK) // Set OK status for successful response
+		if err := json.NewEncoder(w).Encode(flamegraphNode); err != nil {
+			log.Printf("Error marshalling FlamegraphNode response: %v", err)
+			// Header already set, can't send new error to client if body writing started.
+		} else {
+			log.Printf("Successfully served Parca query (json_flamegraph): %s, range: %s - %s", query, startStr, endStr)
+		}
+	} else {
+		// Standard protobuf message response
+		actualProtoResponse, ok := parcaResponse.(*queryv1alpha1.QueryResponse)
+		if !ok || actualProtoResponse == nil {
+			log.Printf("Error: QueryParca returned unexpected type for standard report or nil response. Type: %T", parcaResponse)
+			writeJSONError(w, "Internal error processing Parca response", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK) // Set OK status for successful response
+		if err := json.NewEncoder(w).Encode(actualProtoResponse); err != nil {
+			log.Printf("Error marshalling Parca protobuf response: %v", err)
+			// Header already set.
+		} else {
+			log.Printf("Successfully served Parca query (protobuf): %s, type: %s, range: %s - %s", query, reportType, startStr, endStr)
+		}
 	}
-	log.Printf("Successfully served Parca query: %s, type: %s, range: %s - %s", query, reportType, startStr, endStr)
 }
 
 type bearerTokenInterceptor struct {

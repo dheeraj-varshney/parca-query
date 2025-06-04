@@ -18,10 +18,12 @@ import (
 
 // mockParcaQuerier is a mock implementation of the ParcaQuerier interface.
 type mockParcaQuerier struct {
-	QueryParcaFunc func(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (*queryv1alpha1.QueryResponse, error)
+	// QueryParcaFunc's signature now returns (any, error) to match the ParcaQuerier interface.
+	QueryParcaFunc func(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (any, error)
 }
 
-func (m *mockParcaQuerier) QueryParca(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (*queryv1alpha1.QueryResponse, error) {
+// QueryParca method matches the ParcaQuerier interface.
+func (m *mockParcaQuerier) QueryParca(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (any, error) {
 	if m.QueryParcaFunc != nil {
 		return m.QueryParcaFunc(ctx, queryStr, start, end, reportTypeStr)
 	}
@@ -65,24 +67,75 @@ func TestParcaQueryHandler(t *testing.T) {
 				"query":      `{__name__="process_cpu"}`,
 				"start":      validStartTimeStr,
 				"end":        validEndTimeStr,
-				"reportType": "flamegraph_arrow",
+				"reportType": "flamegraph_arrow", // This is a standard protobuf response
 			},
 			mockSetup: func(mq *mockParcaQuerier) {
-				mq.QueryParcaFunc = func(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (*queryv1alpha1.QueryResponse, error) {
+				mq.QueryParcaFunc = func(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (any, error) {
+					// Return as any
 					return sampleQueryResponse, nil
 				}
 			},
 			expectedStatusCode: http.StatusOK,
 			checkBody: func(t *testing.T, body []byte, expectedStatusCode int) {
+				// Expecting queryv1alpha1.QueryResponse for this report type
 				var resp queryv1alpha1.QueryResponse
 				if err := json.Unmarshal(body, &resp); err != nil {
-					t.Fatalf("Failed to unmarshal response body: %v. Body: %s", err, string(body))
+					t.Fatalf("Failed to unmarshal QueryResponse body: %v. Body: %s", err, string(body))
 				}
-				// Basic check, can be more thorough. For proto, direct comparison is hard.
 				if resp.GetFlamegraphArrow().GetTotal() != sampleQueryResponse.GetFlamegraphArrow().GetTotal() {
 					t.Errorf("Expected flamegraph total %d, got %d", sampleQueryResponse.GetFlamegraphArrow().GetTotal(), resp.GetFlamegraphArrow().GetTotal())
 				}
 			},
+		},
+		// Test cases for json_flamegraph
+		{
+			name: "success json_flamegraph",
+			queryParams: map[string]string{
+				"query":      `{__name__="process_cpu"}`,
+				"start":      validStartTimeStr,
+				"end":        validEndTimeStr,
+				"reportType": "json_flamegraph",
+			},
+			mockSetup: func(mq *mockParcaQuerier) {
+				mq.QueryParcaFunc = func(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (any, error) {
+					return &FlamegraphNode{Name: "root", Value: 100, Children: []*FlamegraphNode{{Name: "child1", Value: 60}}}, nil
+				}
+			},
+			expectedStatusCode: http.StatusOK,
+			checkBody: func(t *testing.T, body []byte, expectedStatusCode int) {
+				var respNode FlamegraphNode
+				if err := json.Unmarshal(body, &respNode); err != nil {
+					t.Fatalf("Failed to unmarshal FlamegraphNode response body: %v. Body: %s", err, string(body))
+				}
+				if respNode.Name != "root" || respNode.Value != 100 {
+					t.Errorf("Unexpected FlamegraphNode data: got name '%s', value %d", respNode.Name, respNode.Value)
+				}
+				if len(respNode.Children) != 1 || respNode.Children[0].Name != "child1" {
+					t.Error("Unexpected FlamegraphNode children")
+				}
+			},
+		},
+		{
+			name: "json_flamegraph - QueryParca returns conversion error",
+			queryParams: map[string]string{"query": "test", "start": validStartTimeStr, "end": validEndTimeStr, "reportType": "json_flamegraph"},
+			mockSetup: func(mq *mockParcaQuerier) {
+				mq.QueryParcaFunc = func(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (any, error) {
+					return nil, errors.New("mock flamegraph conversion error")
+				}
+			},
+			expectedStatusCode: http.StatusInternalServerError, // This error comes from QueryParca, could be 500
+			expectedErrorMsg:   "mock flamegraph conversion error",
+		},
+		{
+			name: "json_flamegraph - QueryParca returns wrong type (handler type assertion error)",
+			queryParams: map[string]string{"query": "test", "start": validStartTimeStr, "end": validEndTimeStr, "reportType": "json_flamegraph"},
+			mockSetup: func(mq *mockParcaQuerier) {
+				mq.QueryParcaFunc = func(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (any, error) {
+					return &queryv1alpha1.QueryResponse{}, nil // Returning incorrect type for json_flamegraph
+				}
+			},
+			expectedStatusCode: http.StatusInternalServerError,
+			expectedErrorMsg:   "Internal error processing flamegraph data",
 		},
 		{
 			name:               "missing query parameter",
@@ -128,24 +181,25 @@ func TestParcaQueryHandler(t *testing.T) {
 		},
 		{
 			name: "QueryParca returns client error (invalid reportType)",
-			queryParams: map[string]string{"query": "test", "start": validStartTimeStr, "end": validEndTimeStr, "reportType": "invalid_type"},
+			queryParams: map[string]string{"query": "test", "start": validStartTimeStr, "end": validEndTimeStr, "reportType": "invalid_type"}, // This uses the generic error path
 			mockSetup: func(mq *mockParcaQuerier) {
-				mq.QueryParcaFunc = func(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (*queryv1alpha1.QueryResponse, error) {
-					return nil, errors.New("invalid reportType: invalid_type") // Error from Querier.QueryParca
+				mq.QueryParcaFunc = func(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (any, error) {
+					// Error from Querier.QueryParca for invalid report type string before conversion attempt
+					return nil, errors.New("invalid reportType: invalid_type")
 				}
 			},
-			expectedStatusCode: http.StatusBadRequest,
+			expectedStatusCode: http.StatusBadRequest, // As per existing handler logic for this error string
 			expectedErrorMsg:   "invalid reportType: invalid_type",
 		},
 		{
 			name: "QueryParca returns server error",
-			queryParams: map[string]string{"query": "test", "start": validStartTimeStr, "end": validEndTimeStr, "reportType": "pprof"},
+			queryParams: map[string]string{"query": "test", "start": validStartTimeStr, "end": validEndTimeStr, "reportType": "pprof"}, // Standard protobuf error path
 			mockSetup: func(mq *mockParcaQuerier) {
-				mq.QueryParcaFunc = func(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (*queryv1alpha1.QueryResponse, error) {
+				mq.QueryParcaFunc = func(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (any, error) {
 					return nil, errors.New("internal Parca server error")
 				}
 			},
-			expectedStatusCode: http.StatusInternalServerError,
+			expectedStatusCode: http.StatusInternalServerError, // Generic internal server error
 			expectedErrorMsg:   "internal Parca server error",
 		},
 	}
