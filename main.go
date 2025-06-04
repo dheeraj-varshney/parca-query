@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"encoding/json"
 
 	"buf.build/gen/go/parca-dev/parca/connectrpc/go/parca/query/v1alpha1/queryv1alpha1connect"
 	"connectrpc.com/connect"
@@ -101,11 +102,12 @@ func main() {
 	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
 	querier := NewQuerier(reg, client, queryRanges)
+	api := &apiHandler{querier: querier}
 
 	var gr run.Group
 	gr.Add(run.SignalHandler(ctx, os.Interrupt, syscall.SIGTERM))
 
-	httpServer := newHTTPServer(reg, *addr)
+	httpServer := newHTTPServer(reg, *addr, api)
 	gr.Add(
 		func() error {
 			log.Printf("HTTP server: running at %s\n", *addr)
@@ -140,16 +142,92 @@ func main() {
 	}
 }
 
-func newHTTPServer(reg *prometheus.Registry, addr string) *http.Server {
+// apiHandler holds dependencies for HTTP handlers.
+type apiHandler struct {
+	querier *Querier
+}
+
+func newHTTPServer(reg *prometheus.Registry, addr string, api *apiHandler) *http.Server {
 	handler := http.NewServeMux()
 	handler.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	handler.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
+	// Register the new Parca query handler
+	handler.HandleFunc("/parcaquery", api.parcaQueryHandler)
+
 
 	server := &http.Server{
 		Addr:    addr,
 		Handler: handler,
 	}
 	return server
+}
+
+// parcaQueryHandler handles requests to query Parca.
+// It parses query parameters: query, start, end, reportType.
+func (h *apiHandler) parcaQueryHandler(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query().Get("query")
+	startStr := r.URL.Query().Get("start")
+	endStr := r.URL.Query().Get("end")
+	reportType := r.URL.Query().Get("reportType")
+
+	// Utility to write JSON errors
+	writeJSONError := func(writer http.ResponseWriter, message string, statusCode int) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(statusCode)
+		json.NewEncoder(writer).Encode(map[string]string{"error": message})
+	}
+
+	// Basic validation for presence of parameters
+	if query == "" || startStr == "" || endStr == "" || reportType == "" {
+		writeJSONError(w, "Missing required query parameters: query, start, end, reportType", http.StatusBadRequest)
+		return
+	}
+
+	// Parse start time
+	startTime, err := time.Parse(time.RFC3339, startStr)
+	if err != nil {
+		log.Printf("Error parsing start time '%s': %v", startStr, err)
+		writeJSONError(w, "Invalid start time format. Expected RFC3339.", http.StatusBadRequest)
+		return
+	}
+
+	// Parse end time
+	endTime, err := time.Parse(time.RFC3339, endStr)
+	if err != nil {
+		log.Printf("Error parsing end time '%s': %v", endStr, err)
+		writeJSONError(w, "Invalid end time format. Expected RFC3339.", http.StatusBadRequest)
+		return
+	}
+
+	// Validate time range
+	if !startTime.Before(endTime) {
+		writeJSONError(w, "Start time must be before end time.", http.StatusBadRequest)
+		return
+	}
+
+	// Call Querier's QueryParca method
+	parcaResponse, err := h.querier.QueryParca(r.Context(), query, startTime, endTime, reportType)
+	if err != nil {
+		log.Printf("QueryParca failed: %v", err)
+		// Inspect error to determine status code
+		errStr := strings.ToLower(err.Error())
+		if strings.Contains(errStr, "invalid reporttype") || strings.Contains(errStr, "reporttype parameter is missing") || strings.Contains(errStr, "invalid report type") {
+			writeJSONError(w, "Failed to query Parca: "+err.Error(), http.StatusBadRequest)
+		} else {
+			writeJSONError(w, "Failed to query Parca: "+err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Marshal successful response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(parcaResponse); err != nil {
+		log.Printf("Error marshalling Parca response: %v", err)
+		// Don't try to write an error response if header already sent, but log it.
+		// Client will likely experience a truncated response.
+	}
+	log.Printf("Successfully served Parca query: %s, type: %s, range: %s - %s", query, reportType, startStr, endStr)
 }
 
 type bearerTokenInterceptor struct {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -61,8 +62,14 @@ type Querier struct {
 	reportTypes []queryv1alpha1.QueryRequest_ReportType
 }
 
+// ParcaQuerier defines the interface for querying Parca.
+// This is implemented by Querier and can be mocked for testing.
+type ParcaQuerier interface {
+	QueryParca(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (*queryv1alpha1.QueryResponse, error)
+}
+
 func NewQuerier(reg *prometheus.Registry, client queryv1alpha1connect.QueryServiceClient, queryTimeRangesConf []time.Duration) *Querier {
-	return &Querier{
+	return &Querier{ // Must satisfy ParcaQuerier
 		done: make(chan struct{}),
 		metrics: querierMetrics{
 			labelsHistogram: promauto.With(reg).NewHistogramVec(
@@ -129,6 +136,49 @@ func NewQuerier(reg *prometheus.Registry, client queryv1alpha1connect.QueryServi
 			queryv1alpha1.QueryRequest_REPORT_TYPE_TABLE_ARROW,
 		},
 	}
+}
+
+// QueryParca fetches data from Parca based on the provided query parameters.
+func (q *Querier) QueryParca(ctx context.Context, queryStr string, start time.Time, end time.Time, reportTypeStr string) (*queryv1alpha1.QueryResponse, error) {
+	var reportType queryv1alpha1.QueryRequest_ReportType
+	switch reportTypeStr {
+	case "pprof":
+		reportType = queryv1alpha1.QueryRequest_REPORT_TYPE_PPROF
+	case "flamegraph_arrow":
+		reportType = queryv1alpha1.QueryRequest_REPORT_TYPE_FLAMEGRAPH_ARROW
+	case "table_arrow":
+		reportType = queryv1alpha1.QueryRequest_REPORT_TYPE_TABLE_ARROW
+	// Add other cases as needed based on queryv1alpha1.QueryRequest_ReportType
+	default:
+		if reportTypeStr == "" {
+			return nil, errors.New("reportType parameter is missing")
+		}
+		return nil, fmt.Errorf("invalid reportType: %s", reportTypeStr)
+	}
+
+	queryRequest := &queryv1alpha1.QueryRequest{
+		Mode: queryv1alpha1.QueryRequest_MODE_MERGE,
+		Options: &queryv1alpha1.QueryRequest_Merge{
+			Merge: &queryv1alpha1.MergeProfile{
+				Query: queryStr,
+				Start: timestamppb.New(start),
+				End:   timestamppb.New(end),
+			},
+		},
+		ReportType:        reportType,
+		NodeTrimThreshold: &nodeTrimThreshold, // Using the global var from querier.go
+	}
+
+	resp, err := q.client.Query(ctx, connect.NewRequest(queryRequest))
+	if err != nil {
+		// TODO: Consider adding metrics here, similar to queryMerge/querySingle.
+		log.Printf("QueryParca(query=%s, reportType=%s, start=%v, end=%v): failed to make request: %v\n", queryStr, reportTypeStr, start, end, err)
+		return nil, fmt.Errorf("parca client query failed: %w", err)
+	}
+
+	// TODO: Consider adding metrics for success here as well.
+	log.Printf("QueryParca(query=%s, reportType=%s, start=%v, end=%v): success\n", queryStr, reportTypeStr, start, end)
+	return resp.Msg, nil
 }
 
 func (q *Querier) Run(ctx context.Context, interval time.Duration) {
