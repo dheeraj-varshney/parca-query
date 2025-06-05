@@ -1,6 +1,6 @@
-# parca-load
+# parca-query
 
-This is a tool that continuously queries Parca instances for their data.
+This is a tool that queries Parca instances for their data.
 
 It is based on the Parca gRPC APIs defined on https://buf.build/parca-dev/parca and uses the generated connect-go code via `go.buf.build/bufbuild/connect-go/parca-dev/parca`.
 
