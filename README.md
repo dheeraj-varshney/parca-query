@@ -1,4 +1,4 @@
-# parca-load
+# parca-query
 
 This is a tool that continuously queries Parca instances for their data.
 
